@@ -1,0 +1,201 @@
+# =========================
+# SPIKE PRIME FLL – Upgraded Gyro Drive + Upgraded Turns
+# Ports: Left motor = E, Right motor = A
+# Logic: same as your program (straight -> settle -> turn -> settle ...)
+# Upgrades:
+# 1) Reset yaw ONCE at start + drive/turn to target heading
+# 2) Distance uses average of encoders (L+R)/2
+# 3) Smooth ramp slowdown near end (not a step)
+# + Better turn control + brake stop
+# =========================
+
+from hub import port, motion_sensor
+import runloop, motor, motor_pair
+
+# ----- MOTORS -----
+PAIR = motor_pair.PAIR_1
+LEFT = port.E
+RIGHT = port.A
+motor_pair.pair(PAIR, LEFT, RIGHT)
+
+# ----- TUNING -----
+WHEEL_CIRCUMFERENCE_CM = 17.6
+
+# Straight control
+KP_STRAIGHT = 1.2
+KD_STRAIGHT = 0.18
+MAX_STEER = 100
+
+# Turn control
+KP_TURN = 2.2            # how strong it turns to heading
+TURN_FAST = 180
+TURN_SLOW = 90
+TURN_SLOW_ZONE_DEG = 10# start slowing down this many degrees before target
+TURN_DEADBAND = 0.8    # consider reached if within this
+
+# Drive slowdown ramp
+DRIVE_SLOW_ZONE_DEG = 200    # degrees of wheel rotation from end to start slowing
+DRIVE_MIN_VEL = 140
+
+# ----- HELPERS -----
+def clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+def yaw_deg():
+    # your convention
+    return motion_sensor.tilt_angles()[0] * -0.1
+
+async def gyro_reset_once():
+    # reset ONLY once at the beginning of the whole run
+    motion_sensor.reset_yaw(0)
+    # stable can sometimes "hang" if the robot is moving/trembling; small sleep is safer
+    await runloop.sleep_ms(200)
+
+def cm_to_motor_deg(cm):
+    return int((abs(cm) / WHEEL_CIRCUMFERENCE_CM) * 360)
+
+def avg_abs_encoder_deg():
+    # average distance by encoder: (|L| + |R|) / 2
+    l = abs(motor.relative_position(LEFT))
+    r = abs(motor.relative_position(RIGHT))
+    return (l + r) // 2
+
+def ramp_velocity(remaining_deg, max_vel, min_vel, slow_zone_deg):
+    """
+    Smooth ramp: far -> max_vel, near -> min_vel.
+    remaining_deg: how many degrees left
+    """
+    if remaining_deg <= 0:
+        return 0
+    if remaining_deg >= slow_zone_deg:
+        return max_vel
+
+    # Linear interpolation from min_vel .. max_vel
+    # remaining=0 => min_vel, remaining=slow_zone => max_vel
+    v = min_vel + (max_vel - min_vel) * (remaining_deg / slow_zone_deg)
+    return int(v)
+
+# =========================
+# STRAIGHT: drive cm while holding a target heading
+# =========================
+async def gyro_straight_cm(cm, velocity=300, min_velocity=DRIVE_MIN_VEL, heading=None):
+    """
+    cm > 0 forward, cm < 0 backward
+    heading: target yaw to hold (deg). If None, uses current yaw at start as target.
+    """
+    direction = 1 if cm >= 0 else -1
+    target_deg = cm_to_motor_deg(cm)
+
+    # lock the heading you want to keep
+    if heading is None:
+        heading = yaw_deg()
+
+    # reset encoders for accurate distance
+    motor.reset_relative_position(LEFT, 0)
+    motor.reset_relative_position(RIGHT, 0)
+
+    prev_error = 0
+
+    while True:
+        pos = avg_abs_encoder_deg()
+        remaining = target_deg - pos
+        if remaining <= 0:
+            break
+
+        # heading error: want yaw == heading
+        error = (yaw_deg() - heading)
+        derr = error - prev_error
+        prev_error = error
+
+        steer = int(-(KP_STRAIGHT * error + KD_STRAIGHT * derr))
+        steer = clamp(steer, -MAX_STEER, MAX_STEER)
+
+        # smooth ramp near the end
+        v = ramp_velocity(remaining, abs(velocity), min_velocity, DRIVE_SLOW_ZONE_DEG)
+
+        motor_pair.move(PAIR, steer, velocity=direction * v)
+        await runloop.sleep_ms(10)
+
+    # stop with brake (helps not to roll)
+    motor_pair.stop(PAIR, stop=motor.BRAKE)
+
+# =========================
+# TURN: turn to an ABSOLUTE heading (relative to the initial reset)
+# =========================
+async def turn_to_heading(target_heading, fast=TURN_FAST, slow=TURN_SLOW,
+                        slow_zone=TURN_SLOW_ZONE_DEG, deadband=TURN_DEADBAND):
+    """
+    Turn until yaw is at target_heading.
+    Uses simple P control + speed cap + slow zone.
+    """
+    while True:
+        y = yaw_deg()
+        error = target_heading - y
+
+        # reached
+        if abs(error) <= deadband:
+            break
+
+        # choose speed cap (slow near target)
+        cap = slow if abs(error) < slow_zone else fast
+
+        # proportional speed (bounded)
+        v = int(KP_TURN * error)
+        v = clamp(v, -cap, cap)
+
+        # tank turn: +v left, -v right (turn right if v>0)
+        motor_pair.move_tank(PAIR, v, -v)
+        await runloop.sleep_ms(5)
+
+    # short brake pulse to reduce overshoot
+    motor_pair.stop(PAIR, stop=motor.BRAKE)
+    await runloop.sleep_ms(40)
+
+async def gyro_turn_right(deg, fast=TURN_FAST, slow=TURN_SLOW, slow_zone=TURN_SLOW_ZONE_DEG):
+    # RIGHT means increase yaw by +deg
+    target = yaw_deg() + abs(deg)
+    await turn_to_heading(target, fast=fast, slow=slow, slow_zone=slow_zone)
+
+async def gyro_turn_left(deg, fast=TURN_FAST, slow=TURN_SLOW, slow_zone=TURN_SLOW_ZONE_DEG):
+    # LEFT means decrease yaw by -deg
+    target = yaw_deg() - abs(deg)
+    await turn_to_heading(target, fast=fast, slow=slow, slow_zone=slow_zone)
+
+# =========================
+# pause
+# =========================
+async def settle(ms=80):
+    await runloop.sleep_ms(ms)
+
+# =========================
+# MAIN (same logic as yours)
+# =========================
+async def main():
+    # IMPORTANT: reset yaw once at the very beginning (in base)
+    await gyro_reset_once()
+
+    # If you want to keep a "global heading reference", store it:
+    base_heading = 0# after reset, base heading is 0
+
+    # ---- Your mission logic ----
+    await gyro_straight_cm(30, velocity=320, heading=base_heading)
+    await settle()
+
+    await gyro_turn_left(20, fast=180, slow=90)
+    await settle()
+
+    # after turning, keep the NEW heading automatically (heading=None locks current yaw)
+    await gyro_straight_cm(-30, velocity=320, heading=None)
+    await settle()
+
+    await gyro_turn_right(20, fast=180, slow=90)
+    await settle()
+
+    await gyro_turn_left(20, fast=240, slow=110)
+    await settle()
+
+runloop.run(main())
